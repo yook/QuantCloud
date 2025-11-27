@@ -29,9 +29,9 @@ const server = http.createServer((req, res) => {
   }
 
   // Публичный health-check (не требует аутентификации)
-  if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok" }));
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
 
