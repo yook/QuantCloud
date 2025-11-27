@@ -66,9 +66,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Remove proxy auth headers before forwarding
+  // Remove proxy auth headers and common forwarding headers to avoid leaking client IP
   delete req.headers["proxy-authorization"];
   delete req.headers["authorization"];
+  delete req.headers["x-forwarded-for"];
+  delete req.headers["x-real-ip"];
+  delete req.headers["forwarded"];
+  delete req.headers["via"];
 
   // Support absolute-form requests (forward proxy) or relative with Host header
   let target = req.url;
