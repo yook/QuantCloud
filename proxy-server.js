@@ -1,159 +1,168 @@
 const http = require("http");
 const https = require("https");
+const net = require("net");
 const url = require("url");
 require("dotenv").config();
 
-// Аутентификация: логин/пароль (Basic) — для продакшена используйте секретный менеджер
 const AUTH_USER = process.env.AUTH_USER || "admin";
 const AUTH_PASS = process.env.AUTH_PASS || "password";
-// Сохраняем поддержку старого ключа как опцию совместимости
 const PORT = process.env.PORT || 3000;
 
-const server = http.createServer((req, res) => {
-  // Разрешаем CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS"
-  );
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Auth-User, X-Auth-Pass, X-Target-URL"
-  );
+function parseBasic(header) {
+  if (!header) return null;
+  if (header.startsWith("Basic ")) {
+    try {
+      const payload = Buffer.from(header.slice(6), "base64").toString("utf8");
+      const idx = payload.indexOf(":");
+      if (idx === -1) return null;
+      return { user: payload.slice(0, idx), pass: payload.slice(idx + 1) };
+    } catch (e) {
+      return null;
+    }
+  }
+  return null;
+}
 
-  // Обработка preflight запросов
+function isAuthorized(header) {
+  const creds = parseBasic(header);
+  if (!creds) return false;
+  return creds.user === AUTH_USER && creds.pass === AUTH_PASS;
+}
+
+function sendProxyAuthRequiredSocket(socket) {
+  socket.write("HTTP/1.1 407 Proxy Authentication Required\r\n");
+  socket.write('Proxy-Authenticate: Basic realm="Proxy"\r\n');
+  socket.write("\r\n");
+}
+
+function sendProxyAuthRequiredResponse(res) {
+  res.writeHead(407, {
+    "Content-Type": "application/json",
+    "Proxy-Authenticate": 'Basic realm="Proxy"',
+  });
+  res.end(JSON.stringify({ error: "Proxy Authentication Required" }));
+}
+
+const server = http.createServer((req, res) => {
+  // health endpoint (no auth)
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok" }));
+    return;
+  }
+
+  // Handle preflight
   if (req.method === "OPTIONS") {
-    res.writeHead(200);
+    res.writeHead(204);
     res.end();
     return;
   }
 
-  // Публичный health-check (не требует аутентификации)
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
+  // Check Proxy-Authorization header (or Authorization for some clients)
+  const proxyAuth =
+    req.headers["proxy-authorization"] || req.headers["authorization"];
+  if (!isAuthorized(proxyAuth)) {
+    sendProxyAuthRequiredResponse(res);
     return;
   }
 
-  // Проверка авторизации: сначала Basic (user:pass), затем заголовки x-auth-user/x-auth-pass, затем legacy key
-  const authHeader = req.headers["authorization"];
-  let authorized = false;
+  // Remove proxy auth headers before forwarding
+  delete req.headers["proxy-authorization"];
+  delete req.headers["authorization"];
 
-  if (authHeader && authHeader.startsWith("Basic ")) {
-    try {
-      const payload = Buffer.from(authHeader.slice(6), "base64").toString(
-        "utf8"
-      );
-      const [user, pass] = payload.split(":");
-      if (user === AUTH_USER && pass === AUTH_PASS) {
-        authorized = true;
-      }
-    } catch (e) {
-      // ignore parse errors
+  // Support absolute-form requests (forward proxy) or relative with Host header
+  let target = req.url;
+  if (!/^https?:\/\//i.test(target)) {
+    const host = req.headers["host"];
+    if (!host) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request: missing Host header" }));
+      return;
     }
+    target = "http://" + host + req.url;
   }
 
-  if (!authorized && req.headers["x-auth-user"] && req.headers["x-auth-pass"]) {
-    const user = req.headers["x-auth-user"];
-    const pass = req.headers["x-auth-pass"];
-    if (user === AUTH_USER && pass === AUTH_PASS) authorized = true;
-  }
-
-  // legacy AUTH_KEY removed — only Basic auth or X-Auth-User/X-Auth-Pass supported
-
-  if (!authorized) {
-    res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({ error: "Unauthorized: Invalid or missing credentials" })
-    );
-    return;
-  }
-
-  // Получение целевого URL
-  const targetUrl = req.headers["x-target-url"] || req.url.substring(1);
-
-  if (!targetUrl) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Bad Request: Target URL is required" }));
-    return;
-  }
-
-  // Валидация URL
-  let parsedUrl;
+  let parsed;
   try {
-    parsedUrl = new url.URL(targetUrl);
-  } catch (error) {
+    parsed = new url.URL(target);
+  } catch (e) {
     res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Bad Request: Invalid target URL" }));
+    res.end(JSON.stringify({ error: "Bad Request: invalid target URL" }));
     return;
   }
 
-  // Выбор протокола (http или https)
-  const protocol = parsedUrl.protocol === "https:" ? https : http;
-
-  // Настройка опций для прокси-запроса
-  const headers = { ...req.headers };
-  // Удаляем внутренние заголовки аутентификации, чтобы не протекали на целевой сервер
-  delete headers["x-auth-key"];
-  delete headers["x-auth-user"];
-  delete headers["x-auth-pass"];
-  delete headers["x-target-url"];
-  delete headers["authorization"];
-
+  const protocol = parsed.protocol === "https:" ? https : http;
   const options = {
-    hostname: parsedUrl.hostname,
-    port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
-    path: parsedUrl.pathname + parsedUrl.search,
+    hostname: parsed.hostname,
+    port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+    path: parsed.pathname + parsed.search,
     method: req.method,
     headers: {
-      ...headers,
-      host: parsedUrl.hostname,
+      ...req.headers,
+      host: parsed.host,
     },
   };
 
-  console.log(
-    `[${new Date().toISOString()}] Proxying ${
-      req.method
-    } request to: ${targetUrl}`
-  );
+  console.log(`[${new Date().toISOString()}] Proxying ${req.method} ${target}`);
 
-  // Выполнение прокси-запроса
   const proxyReq = protocol.request(options, (proxyRes) => {
-    // Копируем заголовки ответа
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
-
-    // Передаем данные от целевого сервера клиенту
     proxyRes.pipe(res);
   });
 
-  // Обработка ошибок
-  proxyReq.on("error", (error) => {
-    console.error(`[${new Date().toISOString()}] Proxy error:`, error.message);
-
-    if (!res.headersSent) {
+  proxyReq.on("error", (err) => {
+    console.error("Proxy request error", err && err.message);
+    if (!res.headersSent)
       res.writeHead(502, { "Content-Type": "application/json" });
-    }
     res.end(
       JSON.stringify({
-        error: "Bad Gateway: Failed to reach target server",
-        details: error.message,
+        error: "Bad Gateway",
+        details: (err && err.message) || null,
       })
     );
   });
 
-  // Передаем тело запроса от клиента к целевому серверу
   req.pipe(proxyReq);
 });
 
+// Handle CONNECT method for HTTPS tunneling
+server.on("connect", (req, clientSocket, head) => {
+  // req.url is host:port
+  const proxyAuth =
+    req.headers["proxy-authorization"] || req.headers["authorization"];
+  if (!isAuthorized(proxyAuth)) {
+    sendProxyAuthRequiredSocket(clientSocket);
+    clientSocket.destroy();
+    return;
+  }
+
+  const [host, port] = req.url.split(":");
+  const serverSocket = net.connect(port || 443, host, () => {
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    // If there is any buffered data, write it to server
+    if (head && head.length) serverSocket.write(head);
+    // Bi-directional piping
+    serverSocket.pipe(clientSocket);
+    clientSocket.pipe(serverSocket);
+  });
+
+  serverSocket.on("error", (err) => {
+    console.error("Tunnel error", err && err.message);
+    try {
+      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    } catch (e) {}
+    clientSocket.destroy();
+  });
+});
+
 server.listen(PORT, () => {
-  console.log(`Proxy server is running on port ${PORT}`);
-  console.log(`Auth user: ${AUTH_USER}`);
-  console.log(`\nUsage examples:`);
-  console.log(`# health (no auth required)`);
-  console.log(`curl http://localhost:${PORT}/health`);
-  console.log(`\n# request using Basic auth (curl -u)`);
+  console.log(`Forward proxy listening on port ${PORT}`);
+  console.log(`Proxy credentials: ${AUTH_USER}:<hidden>`);
+  console.log("Health endpoint: GET /health (no auth)");
   console.log(
-    `curl -u ${AUTH_USER}:${AUTH_PASS} -H \"X-Target-URL: https://api.example.com/data\" http://localhost:${PORT}`
+    "Use as HTTP proxy: curl -x http://BOT:PASS@HOST:PORT http://example.com"
   );
-  // legacy key support removed
+  console.log(
+    "Use as HTTPS proxy (CONNECT): curl -x http://BOT:PASS@HOST:PORT https://example.com"
+  );
 });
