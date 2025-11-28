@@ -61,8 +61,15 @@ const server = http.createServer((req, res) => {
   // Check Proxy-Authorization header (or Authorization for some clients)
   const proxyAuth =
     req.headers["proxy-authorization"] || req.headers["authorization"];
-  if (!isAuthorized(proxyAuth)) {
+  // If header missing -> ask for proxy auth (407)
+  if (!proxyAuth) {
     sendProxyAuthRequiredResponse(res);
+    return;
+  }
+  // If header present but invalid -> Forbidden (403)
+  if (!isAuthorized(proxyAuth)) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Forbidden: invalid credentials" }));
     return;
   }
 
@@ -134,8 +141,15 @@ server.on("connect", (req, clientSocket, head) => {
   // req.url is host:port
   const proxyAuth =
     req.headers["proxy-authorization"] || req.headers["authorization"];
-  if (!isAuthorized(proxyAuth)) {
+  // If header missing -> respond 407 on socket
+  if (!proxyAuth) {
     sendProxyAuthRequiredSocket(clientSocket);
+    clientSocket.destroy();
+    return;
+  }
+  // If header present but invalid -> respond 403 on socket
+  if (!isAuthorized(proxyAuth)) {
+    try { clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (e) {}
     clientSocket.destroy();
     return;
   }
