@@ -30,17 +30,23 @@ function isAuthorized(header) {
 }
 
 function sendProxyAuthRequiredSocket(socket) {
+  const body = JSON.stringify({ error: "proxy_auth_failed", message: "Invalid credentials" });
   socket.write("HTTP/1.1 407 Proxy Authentication Required\r\n");
   socket.write('Proxy-Authenticate: Basic realm="Proxy"\r\n');
+  socket.write('Content-Type: application/json\r\n');
+  socket.write(`Content-Length: ${Buffer.byteLength(body)}\r\n`);
   socket.write("\r\n");
+  socket.write(body);
 }
 
 function sendProxyAuthRequiredResponse(res) {
+  const body = JSON.stringify({ error: "proxy_auth_failed", message: "Invalid credentials" });
   res.writeHead(407, {
     "Content-Type": "application/json",
     "Proxy-Authenticate": 'Basic realm="Proxy"',
+    "Content-Length": Buffer.byteLength(body),
   });
-  res.end(JSON.stringify({ error: "Proxy Authentication Required" }));
+  res.end(body);
 }
 
 const server = http.createServer((req, res) => {
@@ -61,15 +67,9 @@ const server = http.createServer((req, res) => {
   // Check Proxy-Authorization header (or Authorization for some clients)
   const proxyAuth =
     req.headers["proxy-authorization"] || req.headers["authorization"];
-  // If header missing -> ask for proxy auth (407)
-  if (!proxyAuth) {
+  // If header missing or invalid -> always respond 407 with Proxy-Authenticate
+  if (!proxyAuth || !isAuthorized(proxyAuth)) {
     sendProxyAuthRequiredResponse(res);
-    return;
-  }
-  // If header present but invalid -> Forbidden (403)
-  if (!isAuthorized(proxyAuth)) {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Forbidden: invalid credentials" }));
     return;
   }
 
@@ -142,17 +142,17 @@ server.on("connect", (req, clientSocket, head) => {
   const proxyAuth =
     req.headers["proxy-authorization"] || req.headers["authorization"];
   // If header missing -> respond 407 on socket
-  if (!proxyAuth) {
-    sendProxyAuthRequiredSocket(clientSocket);
-    clientSocket.destroy();
-    return;
-  }
-  // If header present but invalid -> respond 403 on socket
-  if (!isAuthorized(proxyAuth)) {
+  if (!proxyAuth || !isAuthorized(proxyAuth)) {
     try {
-      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-    } catch (e) {}
-    clientSocket.destroy();
+      sendProxyAuthRequiredSocket(clientSocket);
+    } catch (e) {
+      // ignore
+    }
+    try {
+      clientSocket.end();
+    } catch (e) {
+      clientSocket.destroy();
+    }
     return;
   }
 
