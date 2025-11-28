@@ -149,7 +149,9 @@ server.on("connect", (req, clientSocket, head) => {
   }
   // If header present but invalid -> respond 403 on socket
   if (!isAuthorized(proxyAuth)) {
-    try { clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (e) {}
+    try {
+      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    } catch (e) {}
     clientSocket.destroy();
     return;
   }
